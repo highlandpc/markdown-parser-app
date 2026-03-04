@@ -22,47 +22,48 @@ import {
 ───────────────────────────────────────────── */
 const REPORT_CSS = `
   body, .report-body {
-    font-family: 'Segoe UI', Calibri, Arial, sans-serif;
-    font-size: 11pt;
+    font-family: 'Calibri', 'Segoe UI', Arial, sans-serif;
+    font-size: 10.5pt;
     color: #1a202c;
-    line-height: 1.8;
+    line-height: 1.75;
     margin: 0;
     padding: 0;
     background: #fff;
   }
   h1 {
-    font-size: 26pt;
+    font-size: 20pt;
     font-weight: 700;
     color: #0f172a;
     margin: 0 0 8pt 0;
-    padding-bottom: 8pt;
+    padding-bottom: 7pt;
     border-bottom: 3px solid #1e40af;
     line-height: 1.2;
+    letter-spacing: -0.3pt;
   }
   h2 {
-    font-size: 17pt;
+    font-size: 14pt;
     font-weight: 700;
     color: #1e3a8a;
-    margin: 22pt 0 8pt 0;
-    padding-bottom: 5pt;
+    margin: 20pt 0 7pt 0;
+    padding-bottom: 4pt;
     border-bottom: 1.5px solid #bfdbfe;
     line-height: 1.3;
   }
   h3 {
-    font-size: 13pt;
+    font-size: 12pt;
     font-weight: 600;
     color: #1e40af;
-    margin: 16pt 0 6pt 0;
+    margin: 14pt 0 5pt 0;
     line-height: 1.3;
   }
   h4 {
-    font-size: 11pt;
+    font-size: 10.5pt;
     font-weight: 600;
     color: #3b82f6;
-    margin: 12pt 0 4pt 0;
+    margin: 10pt 0 4pt 0;
   }
   p {
-    margin: 0 0 9pt 0;
+    margin: 0 0 8pt 0;
     text-align: justify;
     orphans: 3;
     widows: 3;
@@ -206,51 +207,69 @@ export default function MarkdownFormatterApp() {
     try {
       const html2pdf = (await import("html2pdf.js")).default;
 
-      const contentHTML = previewRef.current
-        ? previewRef.current.innerHTML
-        : "";
+      const contentHTML = previewRef.current ? previewRef.current.innerHTML : "";
 
-      // Full self-contained styled container rendered off-screen
+      /*
+       * ROOT CAUSE FIX — why PDFs were blank:
+       *   position:fixed + left:-99999px = element is outside the viewport.
+       *   Browsers skip painting off-viewport fixed elements, so html2canvas
+       *   captured a blank canvas → blank PDF.
+       *
+       * FIX: position:fixed at left:0,top:0 (in-viewport) with opacity:0
+       *   The browser MUST render it (it occupies the viewport corner),
+       *   but the user never sees it (opacity:0, z-index:-9999).
+       */
       const container = document.createElement("div");
       container.style.cssText =
-        "position:fixed;left:-99999px;top:0;width:794px;background:#ffffff;" +
-        "padding:72px 80px;box-sizing:border-box;";
+        "position:fixed;left:0;top:0;width:794px;background:#ffffff;" +
+        "opacity:0;pointer-events:none;z-index:-9999;";
 
-      // Inject scoped styles
-      const style = document.createElement("style");
-      style.textContent = REPORT_CSS.replace(/body, \.report-body/g, ".pdf-root");
-      container.appendChild(style);
+      // Inject scoped styles into the container (NOT captured — inner is captured)
+      const styleTag = document.createElement("style");
+      styleTag.textContent = REPORT_CSS.replace(/body, \.report-body/g, ".pdf-root");
+      container.appendChild(styleTag);
 
+      // Content div — this is what we capture (.from(inner) not .from(container))
       const inner = document.createElement("div");
       inner.className = "pdf-root";
+      inner.style.cssText = "padding:48px 52px;box-sizing:border-box;";
       inner.innerHTML = contentHTML;
       container.appendChild(inner);
 
       document.body.appendChild(container);
 
+      // Allow two animation frames for the browser to fully lay out the element
+      await new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(r)));
+
       await html2pdf()
         .set({
-          margin: 0,
+          /*
+           * ROOT CAUSE FIX — why PDF was single-page:
+           *   unit:"px" with a raw [794,1123] array is poorly supported by
+           *   html2pdf's internal page-break math → everything squashed to 1 page.
+           * FIX: use standard unit:"mm" + format:"a4".
+           */
+          margin: [10, 12, 12, 12], // mm — top/right/bottom/left
           filename: `${fileName || "report"}.pdf`,
-          image: { type: "jpeg", quality: 1 },
+          image: { type: "jpeg", quality: 0.98 },
           html2canvas: {
             scale: 2,
             useCORS: true,
+            allowTaint: true,
             logging: false,
             backgroundColor: "#ffffff",
-            windowWidth: 794,
           },
           jsPDF: {
-            unit: "px",
-            format: [794, 1123],
+            unit: "mm",
+            format: "a4",
             orientation: "portrait",
           },
           pagebreak: {
             mode: ["css", "legacy"],
-            avoid: ["tr", "td", "li", "pre", "blockquote"],
+            avoid: ["tr", "td", "li", "pre", "blockquote", "h2", "h3"],
           },
         })
-        .from(container)
+        .from(inner)   // Capture content div only — not the wrapper with <style> tag
         .save();
 
       document.body.removeChild(container);
@@ -337,16 +356,16 @@ export default function MarkdownFormatterApp() {
   // Heading paragraph (children carry font/colour since heading style alone won't)
   const hPara = (text, level) => {
     const map = {
-      1: { h: HeadingLevel.HEADING_1, sz: 52, col: C.h1,
-           sp: { before: 0,   after: 200, line: 300 },
+      1: { h: HeadingLevel.HEADING_1, sz: 44, col: C.h1,
+           sp: { before: 0,   after: 180, line: 300 },
            br: { bottom: { style: BorderStyle.THICK, size: 18, color: C.accent, space: 4 } } },
-      2: { h: HeadingLevel.HEADING_2, sz: 34, col: C.h2,
-           sp: { before: 320, after: 160, line: 300 },
+      2: { h: HeadingLevel.HEADING_2, sz: 30, col: C.h2,
+           sp: { before: 280, after: 140, line: 300 },
            br: { bottom: { style: BorderStyle.SINGLE, size: 6, color: C.border, space: 4 } } },
-      3: { h: HeadingLevel.HEADING_3, sz: 26, col: C.h3,
-           sp: { before: 240, after: 120, line: 300 } },
+      3: { h: HeadingLevel.HEADING_3, sz: 24, col: C.h3,
+           sp: { before: 220, after: 100, line: 300 } },
       4: { h: HeadingLevel.HEADING_4, sz: 22, col: C.h4,
-           sp: { before: 200, after: 80,  line: 300 } },
+           sp: { before: 180, after: 80,  line: 300 } },
     };
     const cfg = map[level] || map[4];
     return new Paragraph({

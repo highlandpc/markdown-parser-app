@@ -195,87 +195,128 @@ export default function MarkdownFormatterApp() {
   const [exporting, setExporting] = useState(false);
   const previewRef = useRef(null);
 
-  /* ═══════════════════════════════════════════
-     PDF EXPORT
-     Build a visible off-screen div with the full
-     rendered HTML + scoped CSS, then capture it.
-     Key fix: element is position:fixed (not display:none)
-     so html2canvas can actually render it.
-  ═══════════════════════════════════════════ */
+  /* ═══════════════════════════════════════════════════════════════════════
+     PDF EXPORT — html2canvas + jsPDF DIRECT  (html2pdf wrapper removed)
+     ─────────────────────────────────────────────────────────────────────
+     WHY html2pdf ALWAYS CROPPED:
+       html2pdf.from(el) deep-clones the element into its own internal
+       overlay:  position:fixed; overflow:hidden; top:0; right:0; bottom:0
+       That overlay is exactly viewport-height. overflow:hidden clips
+       everything below. Even windowHeight/onclone hacks are unreliable
+       because the clone is in a separate iframe that re-applies viewport.
+
+     THE FIX — bypass html2pdf entirely:
+       1. Build render div at position:fixed; z-index:-9999  (in-viewport so
+          browser MUST compute & render it; behind page so user never sees it;
+          html2canvas re-traverses DOM so z-index doesn't affect capture).
+       2. html2canvas(div) directly — full scrollHeight, zero overflow clipping.
+       3. jsPDF manual pagination — canvas sliced into exact A4 pages.
+  ═══════════════════════════════════════════════════════════════════════ */
   const exportPDF = async () => {
     setExporting(true);
+    let renderRoot = null;
     try {
-      const html2pdf = (await import("html2pdf.js")).default;
+      const html2canvas = (await import("html2canvas")).default;
+      const { jsPDF }   = await import("jspdf");
 
       const contentHTML = previewRef.current ? previewRef.current.innerHTML : "";
 
-      /*
-       * ROOT CAUSE FIX — why PDFs were blank:
-       *   position:fixed + left:-99999px = element is outside the viewport.
-       *   Browsers skip painting off-viewport fixed elements, so html2canvas
-       *   captured a blank canvas → blank PDF.
-       *
-       * FIX: position:fixed at left:0,top:0 (in-viewport) with opacity:0
-       *   The browser MUST render it (it occupies the viewport corner),
-       *   but the user never sees it (opacity:0, z-index:-9999).
-       */
-      const container = document.createElement("div");
-      container.style.cssText =
-        "position:fixed;left:0;top:0;width:794px;background:#ffffff;" +
-        "opacity:0;pointer-events:none;z-index:-9999;";
+      // ── 1. Build self-contained render element ─────────────────────────
+      // position:fixed; z-index:-9999 → element is inside the viewport (browser
+      // MUST compute layout and paint it) but buried behind all page content
+      // (user never sees it). html2canvas re-traverses DOM to build its own
+      // canvas, so z-index has zero effect on what it captures.
+      renderRoot = document.createElement("div");
+      renderRoot.setAttribute("aria-hidden", "true");
+      renderRoot.style.cssText =
+        "position:fixed;top:0;left:0;width:794px;z-index:-9999;" +
+        "background:#ffffff;pointer-events:none;overflow:visible;";
 
-      // Inject scoped styles into the container (NOT captured — inner is captured)
-      const styleTag = document.createElement("style");
-      styleTag.textContent = REPORT_CSS.replace(/body, \.report-body/g, ".pdf-root");
-      container.appendChild(styleTag);
+      const styleEl = document.createElement("style");
+      styleEl.textContent = REPORT_CSS.replace(/body, \.report-body/g, ".pdf-body");
+      renderRoot.appendChild(styleEl);
 
-      // Content div — this is what we capture (.from(inner) not .from(container))
-      const inner = document.createElement("div");
-      inner.className = "pdf-root";
-      inner.style.cssText = "padding:48px 52px;box-sizing:border-box;";
-      inner.innerHTML = contentHTML;
-      container.appendChild(inner);
+      const contentDiv = document.createElement("div");
+      contentDiv.className = "pdf-body";
+      // 42px top/bottom, 52px left/right ≈ 12mm margins on 794px A4 canvas
+      contentDiv.style.cssText =
+        "padding:42px 52px;box-sizing:border-box;background:#ffffff;width:794px;";
+      contentDiv.innerHTML = contentHTML;
+      renderRoot.appendChild(contentDiv);
 
-      document.body.appendChild(container);
+      document.body.appendChild(renderRoot);
 
-      // Allow two animation frames for the browser to fully lay out the element
+      // ── 2. Let fonts load + two rAF cycles for full layout pass ────────
+      await document.fonts.ready;
       await new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(r)));
 
-      await html2pdf()
-        .set({
-          /*
-           * ROOT CAUSE FIX — why PDF was single-page:
-           *   unit:"px" with a raw [794,1123] array is poorly supported by
-           *   html2pdf's internal page-break math → everything squashed to 1 page.
-           * FIX: use standard unit:"mm" + format:"a4".
-           */
-          margin: [10, 12, 12, 12], // mm — top/right/bottom/left
-          filename: `${fileName || "report"}.pdf`,
-          image: { type: "jpeg", quality: 0.98 },
-          html2canvas: {
-            scale: 2,
-            useCORS: true,
-            allowTaint: true,
-            logging: false,
-            backgroundColor: "#ffffff",
-          },
-          jsPDF: {
-            unit: "mm",
-            format: "a4",
-            orientation: "portrait",
-          },
-          pagebreak: {
-            mode: ["css", "legacy"],
-            avoid: ["tr", "td", "li", "pre", "blockquote", "h2", "h3"],
-          },
-        })
-        .from(inner)   // Capture content div only — not the wrapper with <style> tag
-        .save();
+      // ── 3. Capture with html2canvas directly ───────────────────────────
+      // scrollX/scrollY correction: html2canvas positions elements using their
+      // absolute document coordinates; if the page is scrolled the render shifts.
+      const canvas = await html2canvas(contentDiv, {
+        scale: 2,
+        useCORS: true,
+        allowTaint: true,
+        backgroundColor: "#ffffff",
+        logging: false,
+        scrollX: -window.scrollX,
+        scrollY: -window.scrollY,
+      });
 
-      document.body.removeChild(container);
+      document.body.removeChild(renderRoot);
+      renderRoot = null;
+
+      // ── 4. Paginate: slice canvas into A4 pages with jsPDF ─────────────
+      const MARGIN_MM  = 12;
+      const PAGE_W_MM  = 210;
+      const PAGE_H_MM  = 297;
+      const PRINT_W_MM = PAGE_W_MM - MARGIN_MM * 2;  // 186mm
+      const PRINT_H_MM = PAGE_H_MM - MARGIN_MM * 2;  // 273mm
+
+      const px2mm      = PRINT_W_MM / canvas.width;
+      const totalMM    = canvas.height * px2mm;
+
+      const pdf = new jsPDF({ unit: "mm", format: "a4", orientation: "portrait" });
+
+      let sliceTopPx = 0;
+      let pageIdx    = 0;
+
+      while (sliceTopPx < canvas.height) {
+        const sliceH_mm = Math.min(PRINT_H_MM, totalMM - sliceTopPx * px2mm);
+        const sliceH_px = Math.round(sliceH_mm / px2mm);
+
+        const slice = document.createElement("canvas");
+        slice.width  = canvas.width;
+        slice.height = sliceH_px;
+        const ctx = slice.getContext("2d");
+        ctx.fillStyle = "#ffffff";
+        ctx.fillRect(0, 0, slice.width, slice.height);
+        ctx.drawImage(
+          canvas,
+          0, sliceTopPx, canvas.width, sliceH_px,
+          0, 0,          canvas.width, sliceH_px
+        );
+
+        if (pageIdx > 0) pdf.addPage();
+        pdf.addImage(
+          slice.toDataURL("image/jpeg", 0.97),
+          "JPEG",
+          MARGIN_MM, MARGIN_MM,
+          PRINT_W_MM, sliceH_mm
+        );
+
+        sliceTopPx += sliceH_px;
+        pageIdx++;
+      }
+
+      pdf.save(`${fileName || "report"}.pdf`);
+
     } catch (err) {
       console.error("PDF export failed:", err);
       alert(`PDF export failed: ${err.message}`);
+      if (renderRoot && document.body.contains(renderRoot)) {
+        document.body.removeChild(renderRoot);
+      }
     } finally {
       setExporting(false);
     }

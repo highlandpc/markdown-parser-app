@@ -4,7 +4,4 @@ import react from "@vitejs/plugin-react";
 export default defineConfig({
   plugins: [react()],
   base: "/markdown-parser-app/",
-  optimizeDeps: {
-    include: ["html2pdf.js"],
-  },
 });
